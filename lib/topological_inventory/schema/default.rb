@@ -142,26 +142,24 @@ module TopologicalInventory
       end
 
       def service_instance_tasks_custom_save(source, tasks_collection)
-        service_instance_collection = tasks_collection.dependency_attributes[:service_instances]&.first
-        src_refs = service_instance_collection&.data.to_a.collect { |inventory_object| inventory_object.source_ref }
-        return if src_refs.blank?
+        service_instances = tasks_collection.dependency_attributes[:service_instances]&.first&.data.to_a
+        target_source_refs = service_instances.collect { |inventory_object| inventory_object.source_ref }
+        return if target_source_refs.blank?
 
-        # Get running tasks
-        tasks_values = Task.where(:state => 'running', :target_type => 'ServiceInstance', :source_id => source.id)
-                             .pluck(:id, :target_source_ref)
-        tasks_id, tasks_source_ref = [], []
-        tasks_values.each do |attrs|
-          tasks_id << attrs[0]
-          tasks_source_ref << attrs[1]
+        # Get running tasks for this batch of service instances
+        tasks_by_target_source_ref = Task.where(:state => "running", :source_id => source.id, :target_type => "ServiceInstance", :target_source_ref => target_source_refs)
+          .index_by(&:target_source_ref)
+
+        # Update the tasks with the service instance id and other information in batches
+        service_instances.find_in_batches do |service_instance_batch|
+          ActiveRecord::Base.transaction do
+            service_instance_batch.each do |service_instance|
+              tasks_by_source_ref[service_instance.source_ref]&.update(
+                task_update_values(service_instance.id, service_instance.external_url, service_instance.extra.finished, service_instance.extra.status)
+              )
+            end
+          end
         end
-
-        # Load saved service instances (IDs needed)
-        svc_instances_values = ServiceInstance.where(:source_ref => tasks_source_ref).pluck(:id, :external_url, :source_ref, Arel.sql("extra->'finished'"), Arel.sql("extra->'status'"))
-        return if svc_instances_values.blank?
-
-        # Updating Tasks
-        # service_instance_tasks_update_effective(svc_instances_values)
-        service_instance_tasks_update_ineffective(svc_instances_values, tasks_id, tasks_source_ref)
       end
 
       def task_update_values(svc_instance_id, external_url, status, finished_timestamp)
@@ -178,21 +176,8 @@ module TopologicalInventory
         }
       end
 
-      # This method is updating one by one using ActiveRecord
-      def service_instance_tasks_update_ineffective(service_instances_values, tasks_id, tasks_source_ref)
-        tasks = {}
-        service_instances_values.each do |attrs|
-          id, external_url, source_ref, finished_timestamp, status = attrs[0], attrs[1], attrs[2], attrs[3], attrs[4]
-
-          task_id = tasks_id[tasks_source_ref.index(source_ref)]
-          tasks[task_id] = task_update_values(id, external_url, status, finished_timestamp)
-
-          Task.update(tasks.keys, tasks.values)
-        end
-      end
-
-      # This method is bulk updating by raw SQL query
-      def service_instance_tasks_update_effective(service_instances_values)
+      # This method is bulk updating by raw SQL query, switch to this when AR 6 supports bulk updating
+      def service_instance_tasks_update_raw_sql(service_instances_values)
         sql_update_values = []
 
         # Preparing SQL update values from loaded ServiceInstances
